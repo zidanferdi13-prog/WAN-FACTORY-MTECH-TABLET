@@ -45,7 +45,7 @@ export function MOConfirmModal() {
         <div className="grid grid-cols-3 divide-x divide-b-card border-b border-b-card">
           {[
             { label: 'Nomor MO',   value: data.nomor_mo     },
-            { label: 'Total Lot',  value: data.qty_plan     },
+            { label: 'Total',      value: data.qty_plan     },
             { label: 'Produk RM',  value: data.total_rm     },
           ].map((s) => (
             <div key={s.label} className="flex flex-col items-center py-4 px-3">

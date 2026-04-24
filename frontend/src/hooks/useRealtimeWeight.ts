@@ -1,157 +1,197 @@
-import { useEffect, useCallback } from 'react';
-import { socketService } from '@/services/socket';
-import { useMOStore, selectExpectedScale } from '@/store/moStore';
+import { useEffect, useCallback, useRef } from 'react';
+import { useMOStore, selectMaterialForScaleFixed } from '@/store/moStore';
 import { useScaleStore } from '@/store/scaleStore';
 import { useUIStore } from '@/store/uiStore';
-import {
-  shouldAutoConfirm,
-  AUTO_CONFIRM_DELAY_MS,
-  formatWeight,
-} from '@/utils/scaleUtils';
-import type { WeightEvent } from '@/types';
+import { shouldAutoConfirm } from '@/utils/scaleUtils';
+import { WEIGHT_WS_URL } from '@/utils/config';
+import { confirmLane } from '@/utils/confirmFlow';
+import type { ScaleType } from '@/types';
 
-/**
- * Subscribes to `weightData` Socket.IO events and drives the core
- * weighing workflow:
- *  - Updates scale weight / stability in the store
- *  - Opens MO input modal when weight detected with no active MO
- *  - Triggers overload alarm when weight exceeds target
- *  - Auto-confirms when stable weight equals target (rounded to 2 dp)
- */
+interface WeightWsPayload {
+  GW1?: number;
+  GW2?: number;
+  FW1?: number;
+  FW2?: number;
+  timestamp?: string;
+}
+
+const STABLE_DELAY_MS = 3000;
+
+function getScaleTargetFromState(scale: ScaleType): number {
+  const targetFromWs = useScaleStore.getState()[scale].target;
+  if (targetFromWs > 0) return targetFromWs;
+
+  const laneState = useMOStore.getState();
+  const laneMaterial = selectMaterialForScaleFixed(laneState, scale);
+  return laneMaterial?.targetWeight ?? 0;
+}
+
 export function useRealtimeWeight() {
-  // ── Store actions ──────────────────────────────────────────────────────────
-  const moStore        = useMOStore();
-  const scaleStore     = useScaleStore();
-  const { openModal, closeModal, setOverloadInfo } = useUIStore();
+  const stableTimersRef = useRef<Record<ScaleType, ReturnType<typeof setTimeout> | null>>({
+    small: null,
+    large: null,
+  });
 
-  // Re-read expectedScale on every render so the callback always sees fresh
-  // values without needing to be re-registered on every state change.
-  const getExpectedScale = useCallback(
-    () => selectExpectedScale(useMOStore.getState()),
-    [],
-  );
+  const lastRoundedWeightRef = useRef<Record<ScaleType, number | null>>({
+    small: null,
+    large: null,
+  });
 
-  const handleConfirm = useCallback(
-    (weight: number, target: number, scale: string, source: string) => {
-      const {
-        activeMO,
-        moData,
-        autoConfirmActive,
-        currentRMIndex,
-        materials,
-        currentLot,
-        setAutoConfirmActive,
-        advanceRM,
-      } = useMOStore.getState();
+  const lastRoundedTargetRef = useRef<Record<ScaleType, number | null>>({
+    small: null,
+    large: null,
+  });
 
-      if (!activeMO || !moData || autoConfirmActive) return;
+  const processScaleWeight = useCallback((scale: ScaleType, weight: number, stable: boolean, timestamp: string, allowAutoConfirm: boolean) => {
+    const scaleActions = useScaleStore.getState();
+    const uiActions = useUIStore.getState();
 
-      const rm = materials[currentRMIndex];
-      if (!rm) return;
+    scaleActions.setWeight(scale, weight, stable, timestamp);
 
-      setAutoConfirmActive(true);
-      console.info(
-        `[${source.toUpperCase()}] RM[${currentRMIndex}]: ${rm.name} | ${weight}/${target} kg | ${scale}`,
-      );
+    const { weightAboveZero, activeMO, setWeightAboveZero } = useMOStore.getState();
+    if (weight > 0 && !weightAboveZero && !activeMO) {
+      setWeightAboveZero(true);
+      uiActions.openModal('moInput');
+    } else if (weight === 0) {
+      setWeightAboveZero(false);
+      scaleActions.setOverload(scale, false);
+      uiActions.closeModal('overload');
+    }
 
-      // Notify backend
-      socketService.emit('print-confirm', {
-        mo:         activeMO,
-        lot:        currentLot,
-        rm_index:   currentRMIndex,
-        rm_name:    rm.name,
-        scale_used: scale as 'small' | 'large',
-        weight,
-        target,
-        timestamp:  new Date().toISOString(),
-      });
+    const target = getScaleTargetFromState(scale);
+    const scaleState = useScaleStore.getState()[scale];
 
-      // Advance after delay (matches original 1.5 s behaviour)
-      setTimeout(() => {
-        setAutoConfirmActive(false);
+    if (target > 0) {
+      if (weight > target && !scaleState.overloadShown) {
+        scaleActions.setOverload(scale, true);
+        uiActions.setOverloadInfo(weight, target);
+        uiActions.openModal('overload');
+      } else if (weight <= target && scaleState.overloadShown) {
+        scaleActions.setOverload(scale, false);
+        uiActions.closeModal('overload');
+      }
+    }
 
-        const result = advanceRM();
+    if (!allowAutoConfirm) return;
 
-        if (result === 'complete') {
-          const { activeMO, totalLot } = useMOStore.getState();
-          socketService.emit('mo-completed', {
-            mo:             activeMO ?? '',
-            lots_completed: totalLot,
-            timestamp:      new Date().toISOString(),
-          });
-          openModal('completion');
-          return;
-        }
+    const laneState = useMOStore.getState();
+    const laneMaterial = selectMaterialForScaleFixed(laneState, scale);
+    const { moData, autoConfirmActive, confirmedByScale } = laneState;
 
-        if (result === 'next_lot') {
-          // Show lot-complete toast info
-          const { currentLot: nextLot } = useMOStore.getState();
-          useUIStore.getState().setLotComplete(nextLot - 1, nextLot);
-          openModal('lotComplete');
-          setTimeout(() => closeModal('lotComplete'), 2600);
-        }
-      }, AUTO_CONFIRM_DELAY_MS);
-    },
-    [openModal, closeModal],
-  );
+    if (
+      moData &&
+      laneMaterial &&
+      stable &&
+      !autoConfirmActive &&
+      !confirmedByScale[scale] &&
+      target > 0 &&
+      shouldAutoConfirm(weight, target, stable)
+    ) {
+      confirmLane({ scale, weight, target, source: 'auto' });
+    }
+  }, []);
 
   useEffect(() => {
-    const socket = socketService.socket;
-    if (!socket) return;
+    let isUnmounting = false;
+    const ws = new WebSocket(WEIGHT_WS_URL);
 
-    const onWeightData = (data: WeightEvent) => {
-      const scale  = data.scale === 'large' ? 'large' : 'small';
-      const weight = parseFloat(String(data.weight)) || 0;
-      const stable = !!data.stable;
-
-      // ── 1. Update store ────────────────────────────────────────────────────
-      scaleStore.setWeight(scale, weight, stable, data.timestamp ?? new Date().toISOString());
-
-      // ── 2. Prompt MO input when scale is first used ───────────────────────
-      const { weightAboveZero, activeMO, setWeightAboveZero } = useMOStore.getState();
-      if (weight > 0 && !weightAboveZero && !activeMO) {
-        setWeightAboveZero(true);
-        openModal('moInput');
-      } else if (weight === 0) {
-        setWeightAboveZero(false);
-        scaleStore.setOverload(scale, false);
-        closeModal('overload');
+    const scheduleStableCheck = (scale: ScaleType, roundedWeight: number) => {
+      if (stableTimersRef.current[scale]) {
+        clearTimeout(stableTimersRef.current[scale]!);
       }
 
-      // ── 3. Overload alarm (only for the expected scale) ───────────────────
-      const expected = getExpectedScale();
-      const { materials, currentRMIndex } = useMOStore.getState();
-      const target = materials[currentRMIndex]?.targetWeight ?? 0;
-      const scaleState = useScaleStore.getState()[scale];
+      stableTimersRef.current[scale] = setTimeout(() => {
+        if (isUnmounting) return;
+        if (lastRoundedWeightRef.current[scale] !== roundedWeight) return;
 
-      if (scale === expected && target > 0) {
-        if (weight > target && !scaleState.overloadShown) {
-          scaleStore.setOverload(scale, true);
-          setOverloadInfo(weight, target);
-          openModal('overload');
-        } else if (weight <= target && scaleState.overloadShown) {
-          scaleStore.setOverload(scale, false);
-          closeModal('overload');
+        const currentWeight = useScaleStore.getState()[scale].weight;
+        processScaleWeight(scale, currentWeight, true, new Date().toISOString(), true);
+      }, STABLE_DELAY_MS);
+    };
+
+    ws.onopen = () => {
+      if (isUnmounting) return;
+      const actions = useScaleStore.getState();
+      actions.setConnection('small', true);
+      actions.setConnection('large', true);
+    };
+
+    ws.onclose = () => {
+      if (isUnmounting) return;
+      const actions = useScaleStore.getState();
+      actions.setConnection('small', false);
+      actions.setConnection('large', false);
+    };
+
+    ws.onerror = () => {
+      if (isUnmounting) return;
+      const actions = useScaleStore.getState();
+      actions.setConnection('small', false);
+      actions.setConnection('large', false);
+    };
+
+    ws.onmessage = (event) => {
+      let data: WeightWsPayload;
+
+      try {
+        data = JSON.parse(event.data) as WeightWsPayload;
+      } catch {
+        return;
+      }
+
+      const scaleActions = useScaleStore.getState();
+      const fw1 = Number(data.FW1);
+      const fw2 = Number(data.FW2);
+
+      if (Number.isFinite(fw1)) {
+        scaleActions.setTarget('small', fw1);
+      }
+      if (Number.isFinite(fw2)) {
+        scaleActions.setTarget('large', fw2);
+      }
+
+      const timestamp = data.timestamp ?? new Date().toISOString();
+      const incoming: Array<{ scale: ScaleType; weight: number; target: number }> = [
+        { scale: 'small', weight: Number(data.GW1), target: Number.isFinite(fw1) ? fw1 : getScaleTargetFromState('small') },
+        { scale: 'large', weight: Number(data.GW2), target: Number.isFinite(fw2) ? fw2 : getScaleTargetFromState('large') },
+      ];
+
+      for (const item of incoming) {
+        if (!Number.isFinite(item.weight)) continue;
+
+        const roundedWeight = Math.round(item.weight * 100) / 100;
+        const roundedTarget = Math.round(item.target * 100) / 100;
+        const prevRoundedWeight = lastRoundedWeightRef.current[item.scale];
+        const prevRoundedTarget = lastRoundedTargetRef.current[item.scale];
+
+        const hasWeightChanged = prevRoundedWeight === null || prevRoundedWeight !== roundedWeight;
+        const hasTargetChanged = prevRoundedTarget === null || prevRoundedTarget !== roundedTarget;
+
+        if (hasWeightChanged || hasTargetChanged) {
+          lastRoundedWeightRef.current[item.scale] = roundedWeight;
+          lastRoundedTargetRef.current[item.scale] = roundedTarget;
+          processScaleWeight(item.scale, item.weight, false, timestamp, false);
+
+          if (hasWeightChanged) {
+            scheduleStableCheck(item.scale, roundedWeight);
+          }
         }
       }
-
-      // ── 4. Auto-confirm ────────────────────────────────────────────────────
-      const { moData, autoConfirmActive } = useMOStore.getState();
-      if (
-        moData &&
-        scale === expected &&
-        !autoConfirmActive &&
-        target > 0 &&
-        shouldAutoConfirm(weight, target, stable)
-      ) {
-        handleConfirm(weight, target, scale, 'auto');
-      }
     };
-
-    socket.on('weightData', onWeightData);
 
     return () => {
-      socket.off('weightData', onWeightData);
+      isUnmounting = true;
+      ws.close();
+
+      if (stableTimersRef.current.small) {
+        clearTimeout(stableTimersRef.current.small);
+        stableTimersRef.current.small = null;
+      }
+
+      if (stableTimersRef.current.large) {
+        clearTimeout(stableTimersRef.current.large);
+        stableTimersRef.current.large = null;
+      }
     };
-  }, [scaleStore, openModal, closeModal, setOverloadInfo, getExpectedScale, handleConfirm]);
+  }, [processScaleWeight]);
 }

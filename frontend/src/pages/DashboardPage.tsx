@@ -1,7 +1,7 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
+import { CircleAlert, Printer, RefreshCcw } from 'lucide-react';
 import { useSocket } from '@/hooks/useSocket';
 import { useRealtimeWeight } from '@/hooks/useRealtimeWeight';
-import { useMODataListener } from '@/hooks/useMODataListener';
 import { MainLayout } from '@/components/layout/MainLayout';
 import { DashboardScreen } from '@/components/dashboard/DashboardScreen';
 import { MOInputModal } from '@/components/mo/MOInputModal';
@@ -11,204 +11,194 @@ import { OverloadAlertModal } from '@/components/modal/OverloadAlertModal';
 import { LotCompleteToast } from '@/components/modal/LotCompleteToast';
 import { CompletionModal } from '@/components/modal/CompletionModal';
 import { MOHistoryList } from '@/components/dashboard/MOHistoryList';
-import { findOneWeight, resetDataWeight, endProcesWeight } from '@/services/timbangan.service';
-import { buildThermalReceipt } from '@/utils/receiptBuilder';
-import { PRINT_URL } from '@/utils/config';
-import type { MOActiveDetail } from '@/types/timbangan';
+import { MOTransactionTable } from '@/components/dashboard/MOTransactionTable';
+import { MOHistoryDetailModal } from '@/components/dashboard/MOHistoryDetailModal';
+import { findOneWeight, resetDataWeight } from '@/services/apiServices';
+import { useMOStore } from '@/store/moStore';
+import { useScaleStore } from '@/store/scaleStore';
+import { useUIStore } from '@/store/uiStore';
+import { confirmLane } from '@/utils/confirmFlow';
+import {
+  adaptFindOneWeightResponse,
+  type MOTransactionDetail,
+} from '@/utils/moHistoryAdapter';
+
+const DETAIL_REFRESH_MS = 4000;
 
 /**
  * Root page that bootstraps all runtime hooks and composes the full dashboard.
- * All Socket.IO listeners are registered here via custom hooks.
  */
 export function DashboardPage() {
-  // Initialise socket connection + status listeners
   useSocket();
   useRealtimeWeight();
-  useMODataListener();
 
-  // State for MO scan and history
-  const [scanInput, setScanInput] = useState('');
+  const moData = useMOStore((s) => s.moData);
+  const resetMO = useMOStore((s) => s.resetMO);
+  const small = useScaleStore((s) => s.small);
+  const large = useScaleStore((s) => s.large);
+  const resetScale = useScaleStore((s) => s.resetAll);
+  const showToast = useUIStore((s) => s.showToast);
+
   const [selectedMOId, setSelectedMOId] = useState<string | null>(null);
-  const [moDetail, setMoDetail] = useState<MOActiveDetail | null>(null);
-  const [showDetailModal, setShowDetailModal] = useState(false);
-  const [loadingDetail, setLoadingDetail] = useState(false);
-  const [printLoading, setPrintLoading] = useState(false);
+  const [selectedDetail, setSelectedDetail] = useState<MOTransactionDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [isHistoryModalOpen, setIsHistoryModalOpen] = useState(false);
+  const [reloadHistoryToken, setReloadHistoryToken] = useState(0);
+  const [actionLoading, setActionLoading] = useState<'none' | 'refresh' | 'reset' | 'confirm'>('none');
 
-  // Handler for MO scan input
-  const handleScanInput = useCallback(async (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key !== 'Enter') return;
-    const value = scanInput.trim();
-    if (value.length <= 15) return;
-    // Call nomorMO and filter
+  const loadHistoryDetail = useCallback(async (tMoId: string, openModal = false) => {
+    setDetailLoading(true);
     try {
-      setLoadingDetail(true);
-      const data = await findOneWeight(value);
-      // Filter allowed products
-      const allowed = [
-        'WAN Semen Abu-abu OPC Tipe I-Curah',
-        'WAN Kapur 200 mesh (CaCO3) Curah',
-      ];
-      const filtered = {
-        ...data,
-        details: (data.details || []).filter((row: any) => allowed.includes(row.name)),
-      };
-      setMoDetail(filtered);
-      setShowDetailModal(true);
-    } catch (err) {
-      // handle error, show toast if needed
+      const response = await findOneWeight(tMoId);
+      const adapted = adaptFindOneWeightResponse(tMoId, response);
+      setSelectedDetail(adapted);
+      if (openModal) setIsHistoryModalOpen(true);
+    } catch {
+      setSelectedDetail(null);
     } finally {
-      setLoadingDetail(false);
-    }
-  }, [scanInput]);
-
-  // Handler for MO history click
-  const handleHistorySelect = useCallback(async (t_mo_id: string) => {
-    setSelectedMOId(t_mo_id);
-    setLoadingDetail(true);
-    try {
-      const data = await findOneWeight(t_mo_id);
-      setMoDetail(data);
-      setShowDetailModal(true);
-    } catch (err) {
-      // handle error
-    } finally {
-      setLoadingDetail(false);
+      setDetailLoading(false);
     }
   }, []);
 
-  // Handler for reset process
-  const handleReset = useCallback(async () => {
-    if (!moDetail?.t_mo_id) return;
-    try {
-      await resetDataWeight(moDetail.t_mo_id);
-      setMoDetail(null);
-      setShowDetailModal(false);
-    } catch (err) {
-      // handle error
-    }
-  }, [moDetail]);
+  const handleHistorySelect = useCallback((t_mo_id: string) => {
+    setSelectedMOId(t_mo_id);
+    void loadHistoryDetail(t_mo_id, true);
+  }, [loadHistoryDetail]);
 
-  // Handler for confirm + print
-  const handlePrint = useCallback(async () => {
-    if (!moDetail?.t_mo_id) return;
-    setPrintLoading(true);
-    try {
-      await endProcesWeight(moDetail.t_mo_id);
-      const data = await findOneWeight(moDetail.t_mo_id);
-      // Sort, remove qty 0, generate seq, calculate totals
-      let products = (data.details || []).filter((row: any) => row.qty > 0);
-      products = products.sort((a: any, b: any) => {
-        if (a.name === b.name) return a.time.localeCompare(b.time);
-        return a.name.localeCompare(b.name);
-      });
-      let seqSemen = 0, seqKapur = 0, totalSemen = 0, totalKapur = 0;
-      products = products.map((row: any) => {
-        let seq = 0;
-        if (row.name.includes('Semen')) {
-          seq = ++seqSemen;
-          totalSemen += row.weight;
-        } else if (row.name.includes('Kapur')) {
-          seq = ++seqKapur;
-          totalKapur += row.weight;
-        }
-        return { ...row, seq };
-      });
-      const receipt = buildThermalReceipt({
-        nomor_mo: data.nomor_mo,
-        products,
-        totalSemen,
-        totalKapur,
-        seqSemen,
-        seqKapur,
-        printDate: new Date().toLocaleString('id-ID'),
-      });
-      // Send print request
-      await fetch(PRINT_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ html: receipt }),
-      });
-      setMoDetail(null);
-      setShowDetailModal(false);
-    } catch (err) {
-      // handle error
-    } finally {
-      setPrintLoading(false);
+  useEffect(() => {
+    const activeMoId = moData?.t_mo_id;
+    if (!activeMoId) return;
+
+    setSelectedMOId(activeMoId);
+    void loadHistoryDetail(activeMoId, false);
+  }, [moData?.t_mo_id, loadHistoryDetail]);
+
+  useEffect(() => {
+    if (!selectedMOId) return;
+
+    const timer = window.setInterval(() => {
+      void loadHistoryDetail(selectedMOId, false);
+    }, DETAIL_REFRESH_MS);
+
+    return () => window.clearInterval(timer);
+  }, [selectedMOId, loadHistoryDetail]);
+
+  const handleRefreshMO = async () => {
+    setActionLoading('refresh');
+    setReloadHistoryToken((v) => v + 1);
+    if (selectedMOId) {
+      await loadHistoryDetail(selectedMOId, false);
     }
-  }, [moDetail]);
+    setActionLoading('none');
+  };
+
+  const handleResetAll = async () => {
+    const tMoId = moData?.t_mo_id ?? selectedMOId;
+    if (!tMoId) {
+      showToast({ type: 'warning', title: 'Belum Ada MO Aktif', message: 'Tidak ada MO untuk di-reset', duration: 2500 });
+      return;
+    }
+
+    setActionLoading('reset');
+    try {
+      await resetDataWeight(tMoId);
+      resetMO();
+      resetScale();
+      setSelectedMOId(null);
+      setSelectedDetail(null);
+      setReloadHistoryToken((v) => v + 1);
+      showToast({ type: 'success', title: 'Reset Berhasil', message: 'Data timbang sudah direset', duration: 2500 });
+    } catch {
+      showToast({ type: 'error', title: 'Reset Gagal', message: 'Coba lagi beberapa saat', duration: 3000 });
+    } finally {
+      setActionLoading('none');
+    }
+  };
+
+  const handleGlobalConfirm = () => {
+    setActionLoading('confirm');
+
+    const didSmall = confirmLane({
+      scale: 'small',
+      weight: small.weight,
+      target: small.target,
+      source: 'manual',
+    });
+
+    const didLarge = confirmLane({
+      scale: 'large',
+      weight: large.weight,
+      target: large.target,
+      source: 'manual',
+    });
+
+    if (!didSmall && !didLarge) {
+      showToast({
+        type: 'warning',
+        title: 'Belum Bisa Confirm',
+        message: 'Pastikan MO aktif dan target FW1/FW2 sudah tersedia',
+        duration: 3000,
+      });
+    }
+
+    setTimeout(() => setActionLoading('none'), 300);
+  };
 
   return (
     <MainLayout>
-      <div className="flex flex-col md:flex-row h-full">
-        {/* Main dashboard area */}
-        <div className="flex-1">
+      <div className="flex h-full flex-col">
+        <div className="min-h-0 flex-1">
           <DashboardScreen />
         </div>
-        {/* MO scan + history BOTTOMBAR */}
-        <div className="w-full md:w-80 bg-bg-elevated border-t border-b-card p-4 flex flex-col gap-4">
-          <div>
-            <label className="block text-xs font-bold text-t-muted uppercase mb-1">Scan Nomor MO</label>
-            <input
-              type="text"
-              value={scanInput}
-              onChange={e => setScanInput(e.target.value)}
-              onKeyDown={handleScanInput}
-              placeholder="Scan/masukkan nomor MO..."
-              className="w-full px-3 py-2 rounded-lg border border-b-card bg-bg-card text-t-primary font-mono text-sm focus:outline-none focus:border-c-blue focus:ring-1 focus:ring-c-blue"
+
+        <div className="border-t border-b-card bg-bg-elevated px-4 py-3">
+          <div className="mb-3 flex items-center justify-end gap-2">
+            <button
+              onClick={handleRefreshMO}
+              disabled={actionLoading !== 'none'}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-amber-500 px-3 py-2 text-xs font-bold text-white transition-colors hover:bg-amber-600 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              <RefreshCcw size={14} /> REFRESH MO
+            </button>
+            <button
+              onClick={handleResetAll}
+              disabled={actionLoading !== 'none'}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-red-600 px-3 py-2 text-xs font-bold text-white transition-colors hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              <CircleAlert size={14} /> RESET ALL
+            </button>
+            <button
+              onClick={handleGlobalConfirm}
+              disabled={actionLoading !== 'none'}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-c-blue px-3 py-2 text-xs font-bold text-white transition-colors hover:bg-c-blue-bright disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              <Printer size={14} /> CONFIRM
+            </button>
+          </div>
+
+          <MOHistoryList
+            onSelect={handleHistorySelect}
+            selectedId={selectedMOId ?? undefined}
+            reloadToken={reloadHistoryToken}
+          />
+
+          <div className="mt-3">
+            <MOTransactionTable
+              rows={selectedDetail?.rows ?? []}
+              loading={detailLoading}
+              emptyText="Pilih MO pada riwayat untuk menampilkan transaksi produk secara live."
             />
           </div>
-          <MOHistoryList onSelect={handleHistorySelect} selectedId={selectedMOId ?? undefined} />
         </div>
       </div>
 
-      {/* MO Detail Modal */}
-      {showDetailModal && moDetail && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-          <div className="bg-bg-card rounded-xl shadow-2xl p-6 w-full max-w-lg relative">
-            <button className="absolute top-3 right-3 text-t-muted hover:text-c-red" onClick={() => setShowDetailModal(false)}>&times;</button>
-            <div className="mb-4">
-              <div className="font-bold text-lg mb-1">Detail MO</div>
-              <div className="font-mono text-base">{moDetail.nomor_mo}</div>
-            </div>
-            <div className="mb-4 max-h-60 overflow-y-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="text-t-muted">
-                    <th className="text-left">Produk</th>
-                    <th>Qty</th>
-                    <th>Berat</th>
-                    <th>Waktu</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {moDetail.details?.map(row => (
-                    <tr key={row.id}>
-                      <td>{row.name}</td>
-                      <td className="text-center">{row.qty}</td>
-                      <td className="text-right">{row.weight}</td>
-                      <td className="text-right">{row.time}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            <div className="flex gap-3 justify-end mt-4">
-              <button
-                className="px-4 py-2 rounded-lg border border-b-card text-t-secondary text-sm font-medium hover:bg-bg-elevated"
-                onClick={handleReset}
-                disabled={loadingDetail}
-              >Reset</button>
-              <button
-                className="px-4 py-2 rounded-lg bg-c-blue text-white text-sm font-semibold hover:bg-c-blue-bright hover:shadow-glow-blue"
-                onClick={handlePrint}
-                disabled={printLoading}
-              >{printLoading ? 'Mencetak...' : 'Konfirmasi & Print'}</button>
-            </div>
-          </div>
-        </div>
-      )}
+      <MOHistoryDetailModal
+        isOpen={isHistoryModalOpen}
+        onClose={() => setIsHistoryModalOpen(false)}
+        detail={selectedDetail}
+        loading={detailLoading}
+      />
 
-      {/* ── Modals & Toasts ───────────────────────────────────────────────── */}
       <MOInputModal />
       <MOConfirmModal />
       <ConfirmResetModal />

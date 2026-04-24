@@ -3,13 +3,89 @@ import { ClipboardList } from 'lucide-react';
 import { ModalOverlay } from '@/components/modal/ModalOverlay';
 import { useMOStore } from '@/store/moStore';
 import { useUIStore } from '@/store/uiStore';
-import { useScaleStore } from '@/store/scaleStore';
-import { socketService } from '@/services/socket';
+import { nomorMO } from '@/services/apiServices';
+import type { MOData } from '@/types';
+
+interface FindOneMOItem {
+  item?: string;
+  qty?: number;
+}
+
+interface FindOneMOData {
+  t_mo_id?: string;
+  nomor_mo?: string;
+  qty_plan?: number;
+  produk_rm?: FindOneMOItem[];
+}
+
+interface FindOneMOResponse {
+  respone_code?: number;
+  respone_desc?: string;
+  data?: FindOneMOData;
+}
+
+function mapFindOneMOToMOData(response: unknown): MOData | null {
+  // Support both legacy payloads and the new `detail` payload shape.
+  const payload = response as any;
+  const source = payload?.data ?? payload;
+  if (!source) return null;
+
+  // Extract common fields
+  const nomor_mo = source.nomor_mo ?? source.nomor ?? source.product_name ?? null;
+  if (!nomor_mo) return null;
+
+  const t_mo_id = source.t_mo_id ?? source.premix_temp_id ?? null;
+  const qtyPlan = Number(source.qty_plan ?? source.qty ?? source.qty_plan_total ?? 0) || 0;
+
+  // Normalise detail array (new payload: `detail`, legacy: `produk_rm`)
+  const rawItems = Array.isArray(source.detail)
+    ? source.detail
+    : Array.isArray(source.produk_rm)
+    ? source.produk_rm
+    : [];
+
+  const mappedItems = rawItems.map((it: any) => {
+    return {
+      name: String(it.product_nrm ?? it.item ?? it.name ?? '-'),
+      qty: Number(it.qty_plan ?? it.qty ?? it.qty_actual ?? 0) || 0,
+    };
+  });
+
+  // Prefer only kapur/semen items if present
+  const filtered = mappedItems.filter((it: any) => {
+    const n = String(it.name ?? '').toLowerCase();
+    return n.includes('kapur') || n.includes('semen');
+  });
+  const produkRM = filtered.length > 0 ? filtered : mappedItems;
+
+  const total_rm = produkRM.length;
+  const produk_rm_items = produkRM.map((it: any) => it.name);
+  const produk_rm_qty = produkRM.map((it: any) => Number(it.qty) || 0);
+
+  const target_weights = produkRM.map((it: any) => {
+    const totalQty = Number(it.qty) || 0;
+    const perLotTarget = qtyPlan > 0 ? totalQty / qtyPlan : 0;
+    return String(perLotTarget);
+  });
+
+  return {
+    t_mo_id,
+    nomor_mo,
+    qty_plan: qtyPlan,
+    total_rm,
+    produk_rm_items,
+    produk_rm_qty,
+    target_weights,
+    lot: qtyPlan,
+  } as MOData;
+}
 
 export function MOInputModal() {
-  const inputRef   = useRef<HTMLInputElement>(null);
-  const isOpen     = useUIStore((s) => s.openModals.has('moInput'));
+  const inputRef = useRef<HTMLInputElement>(null);
+  const isOpen = useUIStore((s) => s.openModals.has('moInput'));
   const closeModal = useUIStore((s) => s.closeModal);
+  const openModal = useUIStore((s) => s.openModal);
+  const showToast = useUIStore((s) => s.showToast);
   const setActiveMO = useMOStore((s) => s.setActiveMO);
   const setWeightAboveZero = useMOStore((s) => s.setWeightAboveZero);
 
@@ -18,21 +94,34 @@ export function MOInputModal() {
     if (isOpen) setTimeout(() => inputRef.current?.focus(), 60);
   }, [isOpen]);
 
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
     const value = inputRef.current?.value.trim() ?? '';
     if (!value) return;
 
-    // Update display in header immediately
     setActiveMO(value);
 
-    // Emit to server — server will respond with mo-data-confirm
-    socketService.emit('mo-confirmed', {
-      mo:        value,
-      timestamp: new Date().toISOString(),
-    });
+    try {
+      const response = await nomorMO(value);
+      const mappedData = mapFindOneMOToMOData(response);
 
-    closeModal('moInput');
-    if (inputRef.current) inputRef.current.value = '';
+      if (!mappedData) {
+        throw new Error('Format data MO tidak valid');
+      }
+
+      setActiveMO(mappedData.nomor_mo);
+      window.__tempMOData = mappedData;
+      closeModal('moInput');
+      openModal('moConfirm');
+
+      if (inputRef.current) inputRef.current.value = '';
+    } catch {
+      showToast({
+        type: 'error',
+        title: 'MO Tidak Ditemukan',
+        message: 'Periksa nomor MO lalu coba lagi',
+        duration: 3500,
+      });
+    }
   };
 
   const handleCancel = () => {

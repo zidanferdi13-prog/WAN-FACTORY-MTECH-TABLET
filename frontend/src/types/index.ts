@@ -9,6 +9,7 @@ export type ScaleType = 'small' | 'large';
 
 /** Raw data returned by the backend when a MO is fetched */
 export interface MOData {
+  t_mo_id?:        string;
   nomor_mo:        string;
   qty_plan:        number;
   total_rm:        number;
@@ -40,6 +41,7 @@ export interface WeightEvent {
 /** Connection/stability state for a single scale */
 export interface SingleScaleState {
   weight:       number;
+  target:       number;
   stable:       boolean;
   connected:    boolean;
   lastUpdate:   string | null;

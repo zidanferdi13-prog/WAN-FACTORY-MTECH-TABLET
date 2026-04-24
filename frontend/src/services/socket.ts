@@ -5,6 +5,7 @@ import type {
   MOConfirmedPayload,
   MOCompletedPayload,
 } from '@/types';
+import { SOCKET_URL } from '@/utils/config';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Typed Socket.IO interfaces
@@ -53,7 +54,7 @@ class SocketService {
   connect(url?: string): AppSocket {
     if (this._socket?.connected) return this._socket;
 
-    this._socket = io(url ?? window.location.origin, {
+    this._socket = io(url ?? SOCKET_URL, {
       transports: ['websocket', 'polling'],
       reconnectionAttempts: 10,
       reconnectionDelay:    2000,

@@ -14,12 +14,12 @@ export default defineConfig({
     proxy: {
       // Proxy Socket.IO and API requests to the backend
       '/socket.io': {
-        target: 'http://localhost:3000',
+        target: 'http://192.168.5.21:3000',
         ws: true,
         changeOrigin: true,
       },
       '/api': {
-        target: 'http://localhost:3000',
+        target: 'http://192.168.5.21:3000',
         changeOrigin: true,
       },
     },

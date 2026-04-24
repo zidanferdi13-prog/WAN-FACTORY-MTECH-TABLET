@@ -7,7 +7,7 @@ import { getScaleForWeight } from '@/utils/scaleUtils';
 // Types
 // ─────────────────────────────────────────────────────────────────────────────
 
-export type AdvanceResult = 'next_rm' | 'next_lot' | 'complete';
+export type AdvanceResult = 'next_rm' | 'complete';
 
 interface MOStoreState {
   // ── State ──────────────────────────────────────────────────────────────────
@@ -19,6 +19,8 @@ interface MOStoreState {
   totalLot:          number;
   autoConfirmActive: boolean;
   weightAboveZero:   boolean;
+  confirmedByScale:  Record<ScaleType, boolean>;
+  completionSent:    boolean;
 
   // ── Actions ────────────────────────────────────────────────────────────────
   setActiveMO:           (mo: string) => void;
@@ -28,6 +30,8 @@ interface MOStoreState {
   advanceRM:             () => AdvanceResult;
   setAutoConfirmActive:  (active: boolean) => void;
   setWeightAboveZero:    (above: boolean) => void;
+  markScaleConfirmed:    (scale: ScaleType, confirmed: boolean) => void;
+  setCompletionSent:     (sent: boolean) => void;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -45,6 +49,8 @@ export const useMOStore = create<MOStoreState>()(
       totalLot:          0,
       autoConfirmActive: false,
       weightAboveZero:   false,
+      confirmedByScale:  { small: false, large: false },
+      completionSent:    false,
 
       setActiveMO: (mo) => set({ activeMO: mo }),
 
@@ -63,8 +69,10 @@ export const useMOStore = create<MOStoreState>()(
           moData:         data,
           materials,
           currentRMIndex: 0,
-          currentLot:     data.lot ?? 0,
+          currentLot:     data.qty_plan ?? 0,
           totalLot:       data.qty_plan,
+          confirmedByScale: { small: false, large: false },
+          completionSent: false,
         });
       },
 
@@ -78,32 +86,28 @@ export const useMOStore = create<MOStoreState>()(
           totalLot:          0,
           autoConfirmActive: false,
           weightAboveZero:   false,
+          confirmedByScale:  { small: false, large: false },
+          completionSent:    false,
         }),
 
       advanceRM: (): AdvanceResult => {
-        const { currentRMIndex, materials, currentLot, totalLot } = get();
+        const { currentRMIndex, materials } = get();
         const nextRM = currentRMIndex + 1;
 
-        // Still more RMs left in this lot
         if (nextRM < materials.length) {
           set({ currentRMIndex: nextRM });
           return 'next_rm';
         }
 
-        // End of lot — advance to next lot
-        const nextLot = currentLot + 1;
-        if (nextLot >= totalLot) {
-          // All lots done
-          set({ currentRMIndex: 0, currentLot: nextLot });
-          return 'complete';
-        }
-
-        set({ currentRMIndex: 0, currentLot: nextLot });
-        return 'next_lot';
+        set({ currentRMIndex: 0 });
+        return 'complete';
       },
 
       setAutoConfirmActive: (active) => set({ autoConfirmActive: active }),
       setWeightAboveZero:   (above)  => set({ weightAboveZero:  above  }),
+      markScaleConfirmed:   (scale, confirmed) =>
+        set((s) => ({ confirmedByScale: { ...s.confirmedByScale, [scale]: confirmed } })),
+      setCompletionSent:    (sent) => set({ completionSent: sent }),
     }),
     { name: 'mo-store' },
   ),
@@ -122,3 +126,49 @@ export const selectExpectedScale = (s: MOStoreState): ScaleType => {
   const mat = s.materials[s.currentRMIndex];
   return mat ? getScaleForWeight(mat.targetWeight) : 'small';
 };
+
+function isKapur(name: string): boolean {
+  return name.toLowerCase().includes('kapur');
+}
+
+function isSemen(name: string): boolean {
+  return name.toLowerCase().includes('semen');
+}
+
+/** Fixed lane mapping: small=Kapur, large=Semen */
+export const selectMaterialForScaleFixed = (
+  s: MOStoreState,
+  scale: ScaleType,
+): Material | null => {
+  if (scale === 'small') {
+    return (
+      s.materials.find((m) => isKapur(m.name)) ??
+      s.materials.find((m) => m.scaleType === 'small') ??
+      null
+    );
+  }
+
+  return (
+    s.materials.find((m) => isSemen(m.name)) ??
+    s.materials.find((m) => m.scaleType === 'large') ??
+    null
+  );
+};
+
+export const selectMaterialIndexForScaleFixed = (
+  s: MOStoreState,
+  scale: ScaleType,
+): number => {
+  if (scale === 'small') {
+    const idxKapur = s.materials.findIndex((m) => isKapur(m.name));
+    if (idxKapur >= 0) return idxKapur;
+    const idxSmall = s.materials.findIndex((m) => m.scaleType === 'small');
+    return idxSmall >= 0 ? idxSmall : 0;
+  }
+
+  const idxSemen = s.materials.findIndex((m) => isSemen(m.name));
+  if (idxSemen >= 0) return idxSemen;
+  const idxLarge = s.materials.findIndex((m) => m.scaleType === 'large');
+  return idxLarge >= 0 ? idxLarge : 0;
+};
+

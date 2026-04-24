@@ -1,18 +1,14 @@
 import { ScalePanel } from '@/components/scale/ScalePanel';
-import { ActiveMaterialCard } from './ActiveMaterialCard';
-import { useMOStore } from '@/store/moStore';
 
 /**
  * The main working area: dual scale panels side-by-side with an optional
  * RM queue column when a MO is active.
  */
 export function DashboardScreen() {
-  const hasActiveMO = useMOStore((s) => !!s.moData);
-
   return (
     <div className="grid h-full gap-3 p-4"
          style={{
-           gridTemplateColumns: hasActiveMO ? '1fr 28px 1fr 260px' : '1fr 28px 1fr',
+           gridTemplateColumns: '1fr 28px 1fr',
          }}>
 
       {/* Small scale panel */}
@@ -30,9 +26,6 @@ export function DashboardScreen() {
 
       {/* Large scale panel */}
       <ScalePanel scaleType="large" />
-
-      {/* RM queue (only when MO is loaded) */}
-      {hasActiveMO && <ActiveMaterialCard />}
     </div>
   );
 }

@@ -11,6 +11,7 @@ interface ScaleStoreState {
   large: SingleScaleState;
 
   setWeight:       (scale: ScaleType, weight: number, stable: boolean, timestamp: string) => void;
+  setTarget:       (scale: ScaleType, target: number) => void;
   setConnection:   (scale: ScaleType, connected: boolean) => void;
   setOverload:     (scale: ScaleType, shown: boolean) => void;
   resetAll:        () => void;
@@ -22,6 +23,7 @@ interface ScaleStoreState {
 
 const defaultScale: SingleScaleState = {
   weight:        0,
+  target:        0,
   stable:        false,
   connected:     false,
   lastUpdate:    null,
@@ -41,6 +43,11 @@ export const useScaleStore = create<ScaleStoreState>()(
       setWeight: (scale, weight, stable, timestamp) =>
         set((state) => ({
           [scale]: { ...state[scale], weight, stable, lastUpdate: timestamp },
+        })),
+
+      setTarget: (scale, target) =>
+        set((state) => ({
+          [scale]: { ...state[scale], target },
         })),
 
       setConnection: (scale, connected) =>
